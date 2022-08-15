@@ -155,6 +155,8 @@ import qualified Control.Exception as X
 import Control.Concurrent(forkIO)
 import Control.Monad(forever,when,void)
 import Text.Read(readMaybe)
+import Text.ParserCombinators.ReadP(char,satisfy,many1,readP_to_S)
+import Data.Char (isDigit,ord)
 import Data.Ratio((%), numerator, denominator)
 import Numeric(showHex, readHex, showFFloat)
 
@@ -558,11 +560,18 @@ sexprToVal expr =
       | [(n,[])] <- readHex ds      -> Bits (4 * length ds) n
     Atom txt
       | Just n <- readMaybe txt     -> Int n
+    Atom txt
+      | Just n <- readFloatMaybe txt     -> Real n
     List [ Atom "-", x ]
       | Int a <- sexprToVal x    -> Int (negate a)
+    List [ Atom "-", x ]
+      | Real a <- sexprToVal x    -> Real (negate a)
     List [ Atom "/", x, y ]
       | Int a <- sexprToVal x
       , Int b <- sexprToVal y    -> Real (a % b)
+    List [ Atom "/", x, y ]
+      | Real a <- sexprToVal x
+      , Real b <- sexprToVal y    -> Real (a / b)
     _ -> Other expr
 
   where
@@ -572,6 +581,20 @@ sexprToVal expr =
   binDigit '0' = Just 0
   binDigit '1' = Just 1
   binDigit _   = Nothing
+
+  run_parser p s = case readP_to_S p s of
+    [(x,"")] -> Just x
+    _ -> Nothing
+  readFloatMaybe :: String -> Maybe Rational
+  readFloatMaybe = run_parser $ do
+    let digits = many1 (satisfy isDigit)
+        value :: String -> Integer
+        value  = foldl (\ a d -> 10*a + fromIntegral (ord d - ord '0')) 0
+    pre <- digits
+    char '.'
+    post <- digits
+    return $ value (pre <> post) % (10 ^ length post)
+    
 
 -- | Get the values of some s-expressions.
 -- Only valid after a 'Sat' result.
