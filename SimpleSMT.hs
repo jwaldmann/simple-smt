@@ -745,6 +745,7 @@ int x | x < 0     = neg (int (negate x))
 -- | Real (well, rational) literals.
 real :: Rational -> SExpr
 real x
+  | x < 0 = neg (real (negate x))
   | toRational y == x = Atom (showFFloat Nothing y "")
   | otherwise = realDiv (int (numerator x)) (int (denominator x))
   where y = fromRational x :: Double
