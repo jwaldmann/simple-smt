@@ -875,7 +875,9 @@ add :: SExpr -> SExpr -> SExpr
 add x y = fun "+" [x,y]
 
 addMany :: [SExpr] -> SExpr
-addMany xs = if null xs then int 0 else fun "+" xs
+addMany [] = int 0
+addMany [x] = x
+addMany xs = fun "+" xs
 
 -- | Subtraction.
 sub :: SExpr -> SExpr -> SExpr
