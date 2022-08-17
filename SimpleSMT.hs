@@ -149,7 +149,7 @@ import Data.Bits(testBit)
 import Data.IORef(newIORef, atomicModifyIORef, modifyIORef', readIORef,
                   writeIORef)
 import System.Process(runInteractiveProcess, waitForProcess, terminateProcess)
-import System.IO (hFlush, hGetLine, hGetContents, hPutStrLn, stdout, hClose, Handle)
+import System.IO (hFlush, hGetLine, hGetContents, hPutStrLn, stdout, hClose, hPutStr, Handle)
 import System.Exit(ExitCode)
 import qualified Control.Exception as X
 import Control.Concurrent(forkIO)
