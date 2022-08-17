@@ -1,11 +1,14 @@
 {-# LANGUAGE Safe #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE PatternGuards #-}
+{-# LANGUAGE ScopedTypeVariables #-} 
+
 -- | A module for interacting with an SMT solver, using SmtLib-2 format.
 module SimpleSMT
   (
     -- * Basic Solver Interface
     Solver(..)
+  , MissingResponse(..), UnexpectedResult(..)
   , newSolver
   , newSolverNotify
   , ackCommand
@@ -265,6 +268,11 @@ readSExpr txt     = case break end txt of
 
 --------------------------------------------------------------------------------
 
+data MissingResponse = MissingResponse
+instance Show MissingResponse where
+  show MissingResponse = "Missing response from solver"
+instance X.Exception MissingResponse
+
 -- | An interactive solver process.
 data Solver = Solver
   { command   :: SExpr -> IO SExpr
@@ -325,7 +333,7 @@ newSolverNotify exe opts mbLog mbOnExit =
               case mb of
                 Just res -> do info ("[<-recv] " ++ showsSExpr res "")
                                return res
-                Nothing  -> fail "Missing response from solver"
+                Nothing  -> X.throw MissingResponse
 
          waitAndCleanup =
            do ec <- waitForProcess h
@@ -373,7 +381,14 @@ loadString s str = go (dropComments str)
                      _ -> xs
 
 
-
+data UnexpectedResult = UnexpectedResult SExpr
+instance X.Exception UnexpectedResult
+instance Show UnexpectedResult where
+  show (UnexpectedResult res) = unlines
+                      [ "Unexpected result from the SMT solver:"
+                      , "  Expected: success"
+                      , "  Result: " ++ showsSExpr res ""
+                      ]
 
 -- | A command with no interesting result.
 ackCommand :: Solver -> SExpr -> IO ()
@@ -381,11 +396,7 @@ ackCommand proc c =
   do res <- command proc c
      case res of
        Atom "success" -> return ()
-       _  -> fail $ unlines
-                      [ "Unexpected result from the SMT solver:"
-                      , "  Expected: success"
-                      , "  Result: " ++ showsSExpr res ""
-                      ]
+       _  -> X.throw $ UnexpectedResult res
 
 -- | A command entirely made out of atoms, with no interesting result.
 simpleCommand :: Solver -> [String] -> IO ()
@@ -545,6 +556,7 @@ assert proc e = ackCommand proc $ fun "assert" [e]
 -- | Check if the current set of assertion is consistent.
 check :: Solver -> IO Result
 check proc =
+  X.handle (\ (e :: MissingResponse) -> return Unknown) $
   do res <- command proc (List [ Atom "check-sat" ])
      case res of
        Atom "unsat"   -> return Unsat
