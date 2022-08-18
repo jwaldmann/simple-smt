@@ -346,23 +346,25 @@ newSolverNotify exe opts mbLog mbOnExit =
            $ setStdin  createPipe
            $ setStdout createPipe
            $ setStderr createPipe
-           $ setCloseFds True -- I don't know why
+           --  $ setCloseFds True
            $ proc exe opts
 
      let terminator h = do
            interruptProcessGroupOf $ unsafeProcessHandle h
-           stopProcess h
+           waiter h
+         waiter h = do
            X.handle ( \ (e :: IOError) -> do
                         hPutStrLn stderr $ "terminator " <> show e
                         if isDoesNotExistError e
                           then do
                             hPutStrLn stderr $ "ignored"
-                            return $ ExitFailure 1
+                            -- return $ ExitFailure 1
                           else do
                             hPutStrLn stderr $ "re-thrown"
                             X.throw e
                     ) $ do
-             waitExitCode h
+             stopProcess h
+           waitExitCode h
                   
      let hIn = getStdin h
          hOut = getStdout h
@@ -378,7 +380,7 @@ newSolverNotify exe opts mbLog mbOnExit =
 
      case mbOnExit of
        Nothing -> pure ()
-       Just this -> void (terminator h)
+       Just this -> void (this =<< waitExitCode h)
 
      let cmd c = do let txt = showsSExpr c ""
                     info ("[send->] " ++ txt)
@@ -401,14 +403,14 @@ newSolverNotify exe opts mbLog mbOnExit =
               info ("[<-recv] " ++ showsSExpr res "")
               return res
 
-         waitAndCleanup = terminator h
+         waitAndCleanup = waiter h
 
-         terminate = waitAndCleanup
+         terminate = terminator h
 
          exit =
            do cmd (List [Atom "exit"])
                 `X.catch` (\X.SomeException{} -> pure ())
-              waitAndCleanup
+              waiter h
 
          solver = Solver { .. }
 
