@@ -1,7 +1,7 @@
-{-# LANGUAGE Safe #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE ScopedTypeVariables #-} 
+{-# LANGUAGE LambdaCase #-} 
 
 -- | A module for interacting with an SMT solver, using SmtLib-2 format.
 module SimpleSMT
@@ -151,11 +151,16 @@ import Data.List(unfoldr,intersperse)
 import Data.Bits(testBit)
 import Data.IORef(newIORef, atomicModifyIORef, modifyIORef', readIORef,
                   writeIORef)
-import System.Process(runInteractiveProcess, waitForProcess, terminateProcess)
-import System.IO (hFlush, hGetLine, hGetContents, hPutStrLn, stdout, hClose, hPutStr, Handle)
+import Control.Monad.Trans.State as S
+import Control.Monad.Trans.Class as S
+-- import System.Process(runInteractiveProcess, waitForProcess, terminateProcess)
+import System.Process.Typed
+import System.Process (interruptProcessGroupOf)
+import System.IO (hFlush, hGetLine, hGetContents, hPutStrLn, stdout, stderr, hClose, hPutStr, hGetChar, Handle)
 import System.Exit(ExitCode)
+import System.IO.Error
 import qualified Control.Exception as X
-import Control.Concurrent(forkIO)
+import Control.Concurrent.Async (async)
 import Control.Monad(forever,when,void)
 import Text.Read(readMaybe)
 import Text.ParserCombinators.ReadP(char,satisfy,many1,readP_to_S)
@@ -265,6 +270,39 @@ readSExpr txt     = case break end txt of
                        _ -> Nothing
   where end x = x == ')' || isSpace x
 
+-- | Read s-expression from handle, possibly blocking.
+-- This is provided to avoid lazy IO, as would be needed by `readSExpr`
+hReadSExpr :: Handle -> IO SExpr
+hReadSExpr h = flip S.evalStateT Nothing $ do
+  let getc h = S.lift $ do
+        c <- hGetChar h
+        -- hPutStrLn stderr $ "getc " <> [c]
+        return c
+      next = do c <- getc h; S.put $ Just c; return c
+      current = S.get >>= \ case
+        Nothing -> do c <- getc h; S.put $ Just c; return c
+        Just c -> return c
+      go = current >>= \ c -> case c of
+        c | isSpace c -> next *> go
+        ';' -> consumeTo (== '\n') *> go
+        '|' -> do
+          s <- consumeTo (== '|')
+          return $ Atom $ c : s
+        '(' -> List <$> (next *> list)
+        c -> do
+          s <- consumeBefore (\c -> c == ')' || isSpace c)
+          return $ Atom $ c : s
+      consumeTo p = next >>= \ c ->
+        if p c then return  [c] else (c :) <$> consumeTo p
+      consumeBefore p = next >>= \ c ->
+        if p c then return  [] else (c :) <$> consumeBefore p
+      list = current >>= \ case
+        c | isSpace c -> next *> list
+        ';' -> consumeTo (== '\n') *> list        
+        ')' -> next *> return []
+        _ -> (:) <$> go <*> list
+  current *> go
+
 
 --------------------------------------------------------------------------------
 
@@ -300,27 +338,47 @@ newSolverNotify ::
   Maybe (ExitCode -> IO ()) {- ^ Do this when the solver exits -} ->
   IO Solver
 newSolverNotify exe opts mbLog mbOnExit =
-  do (hIn, hOut, hErr, h) <- runInteractiveProcess exe opts Nothing Nothing
+  do
+
+     -- (hIn, hOut, hErr, h) <- runInteractiveProcess exe opts Nothing Nothing
+     h <- startProcess
+           $ setCreateGroup True
+           $ setStdin  createPipe
+           $ setStdout createPipe
+           $ setStderr createPipe
+           $ setCloseFds True -- I don't know why
+           $ proc exe opts
+
+     let terminator h = do
+           interruptProcessGroupOf $ unsafeProcessHandle h
+           stopProcess h
+           X.handle ( \ (e :: IOError) -> do
+                        hPutStrLn stderr $ "terminator " <> show e
+                        if isDoesNotExistError e
+                          then do
+                            hPutStrLn stderr $ "ignored"
+                            return $ ExitFailure 1
+                          else do
+                            hPutStrLn stderr $ "re-thrown"
+                            X.throw e
+                    ) $ do
+             waitExitCode h
+                  
+     let hIn = getStdin h
+         hOut = getStdout h
+         hErr = getStderr h
 
      let info a = case mbLog of
                     Nothing -> return ()
                     Just l  -> logMessage l a
 
-     _ <- forkIO $ forever (do errs <- hGetLine hErr
+     _ <- async $  forever (do errs <- hGetLine hErr
                                info ("[stderr] " ++ errs))
                     `X.catch` \X.SomeException {} -> return ()
 
      case mbOnExit of
        Nothing -> pure ()
-       Just this -> void (forkIO (this =<< waitForProcess h))
-
-     getResponse <-
-       do txt <- hGetContents hOut                  -- Read *all* output
-          ref <- newIORef (unfoldr readSExpr txt)  -- Parse, and store result
-          return $ atomicModifyIORef ref $ \xs ->
-                      case xs of
-                        []     -> (xs, Nothing)
-                        y : ys -> (ys, Just y)
+       Just this -> void (terminator h)
 
      let cmd c = do let txt = showsSExpr c ""
                     info ("[send->] " ++ txt)
@@ -328,22 +386,24 @@ newSolverNotify exe opts mbLog mbOnExit =
                     hFlush hIn
 
          command c =
+           X.handle ( \ (e::X.SomeException) -> do
+                        hPutStrLn stderr $ "command got (and re-throws) " <> show e
+                        terminator h
+                        X.throw e
+                    ) $
+           X.handle ( \ (e::X.IOException) -> do
+                        hPutStrLn stderr $ "command got (and re-throws as MissingResponse) " <> show e
+                        terminator h
+                        X.throw MissingResponse
+                    ) $
            do cmd c
-              mb <- getResponse
-              case mb of
-                Just res -> do info ("[<-recv] " ++ showsSExpr res "")
-                               return res
-                Nothing  -> X.throw MissingResponse
+              res <- hReadSExpr hOut
+              info ("[<-recv] " ++ showsSExpr res "")
+              return res
 
-         waitAndCleanup =
-           do ec <- waitForProcess h
-              X.catch (do hClose hIn
-                          hClose hOut
-                          hClose hErr)
-                      (\ex -> info (show (ex::X.IOException)))
-              return ec
+         waitAndCleanup = terminator h
 
-         terminate = terminateProcess h *> waitAndCleanup
+         terminate = waitAndCleanup
 
          exit =
            do cmd (List [Atom "exit"])
